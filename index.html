@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Salesforce Queue Inflow Dashboard</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- Chart.js for data visualization -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <!-- Header / Navigation -->
+  <header class="slds-header">
+    <div class="header-container">
+      <div class="header-left">
+        <div class="sf-cloud-icon">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="header-title">Queue Inflow Analytics</h1>
+          <p class="header-subtitle">Monthly Intake & Queue Dynamics Monitoring</p>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="queue-badge">
+          <span class="pulse-dot"></span>
+          <span id="queueNameBadge">Admin Queue</span>
+        </div>
+        <button class="btn btn-primary" id="refreshDataBtn">↻ Refresh</button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Dashboard Container -->
+  <main class="dashboard-wrapper">
+    <!-- Filter & Window Toolbar -->
+    <div class="toolbar-card">
+      <div class="toolbar-info">
+        <label for="timeRangeSelect" class="label-badge">Timeframe:</label>
+        <select id="timeRangeSelect" class="table-filter" style="margin: 0 10px; font-weight: 600;">
+          <option value="lastMonth">Last Calendar Month</option>
+          <option value="rolling30">Last 30 Days</option>
+        </select>
+        <span class="window-range" id="dateRangeText">Loading timeframe...</span>
+      </div>
+      <div class="toolbar-actions">
+        <input type="file" id="csvFileInput" accept=".csv, .json" style="display: none;" />
+        <button class="btn btn-sm btn-outline" onclick="document.getElementById('csvFileInput').click()">
+          Upload Salesforce CSV/JSON
+        </button>
+        <button class="btn btn-sm btn-outline" id="exportCsvBtn">Export Report CSV</button>
+      </div>
+    </div>
+
+    <!-- Executive KPI Metrics -->
+    <section class="kpi-grid">
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">TOTAL INFLOW</span>
+          <span class="kpi-icon">📥</span>
+        </div>
+        <div class="kpi-value" id="kpiTotalInflow">0</div>
+        <div class="kpi-subtext positive" id="kpiGrowth">▲ +14.2% vs previous period</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">DAILY AVERAGE</span>
+          <span class="kpi-icon">📊</span>
+        </div>
+        <div class="kpi-value" id="kpiDailyAvg">0</div>
+        <div class="kpi-subtext" id="kpiAvgSplit">Weekday avg: ~0 / day</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">PEAK ARRIVAL DAY</span>
+          <span class="kpi-icon">⚡</span>
+        </div>
+        <div class="kpi-value" id="kpiPeakDay">--</div>
+        <div class="kpi-subtext warning" id="kpiPeakCount">0 tickets arriving</div>
+      </div>
+
+      <div class="kpi-card">
+        <div class="kpi-header">
+          <span class="kpi-title">MEDIAN WAIT IN QUEUE</span>
+          <span class="kpi-icon">⏱</span>
+        </div>
+        <div class="kpi-value" id="kpiWaitTime">24m</div>
+        <div class="kpi-subtext" id="kpiSlaStatus">94.8% First-Touch SLA Met</div>
+      </div>
+    </section>
+
+    <!-- Analytics Charts Grid -->
+    <section class="charts-grid">
+      <!-- Main Daily Inflow Chart -->
+      <div class="chart-card card-span-2">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Daily Ticket Intake Velocity</h3>
+            <p class="card-subtitle">Number of cases routed into this queue per calendar day</p>
+          </div>
+          <div class="chart-controls">
+            <label class="toggle-control">
+              <input type="checkbox" id="toggleMa" checked />
+              <span>Show 7-Day Trendline</span>
+            </label> saz
+          </div>
+        </div>
+        <div class="canvas-container main-canvas">
+          <canvas id="dailyInflowChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Channel Breakdown Donut -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Intake Origin Breakdown</h3>
+            <p class="card-subtitle">Channel entry distribution</p>
+          </div>
+        </div>
+        <div class="canvas-container">
+          <canvas id="originChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Hourly Intake Heatmap / Curve -->
+      <div class="chart-card">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Hourly Arrival Curve</h3>
+            <p class="card-subtitle">Peak queue entry hours (UTC)</p>
+          </div>
+        </div>
+        <div class="canvas-container">
+          <canvas id="hourlyChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Priority Distribution Bar -->
+      <div class="chart-card card-span-2">
+        <div class="card-header">
+          <div>
+            <h3 class="card-title">Inflow by Priority Tier</h3>
+            <p class="card-subtitle">Critical P1 through Low P4 tickets</p>
+          </div>
+        </div>
+        <div class="canvas-container">
+          <canvas id="priorityChart"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Case Detail Table -->
+    <section class="table-section">
+      <div class="table-card">
+        <div class="table-toolbar">
+          <div class="table-search-group">
+            <input type="text" id="searchInput" placeholder="Search Case #, Subject, Account..." class="table-search" />
+            <select id="priorityFilter" class="table-filter">
+              <option value="ALL">All Priorities</option>
+              <option value="Critical">Critical</option>
+              <option value="High">High</option>
+              <option value="Medium">Medium</option>
+              <option value="Low">Low</option>
+            </select>
+            <select id="originFilter" class="table-filter">
+              <option value="ALL">All Origins</option>
+              <option value="Email">Email</option>
+              <option value="Web">Web Portal</option>
+              <option value="API">API/Integration</option>
+              <option value="Phone">Phone</option>
+            </select>
+          </div>
+          <div class="record-count" id="recordCountText">Showing 0 cases</div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="slds-table">
+            <thead>
+              <tr>
+                <th>Case Number</th>
+                <th>Subject</th>
+                <th>Priority</th>
+                <th>Origin</th>
+                <th>Routed Timestamp</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="casesTableBody">
+              <!-- Populated by app.js -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Settings & SOQL Helper Modal -->
+  <div class="modal-backdrop" id="settingsModal">
+    <div class="modal-window">
+      <div class="modal-header">
+        <h2>Salesforce Queue Configuration & SOQL</h2>
+        <button class="close-btn" id="closeSettingsBtn">&times;</button>
+      </div>
+      <div class="modal-body">
+        <label class="form-label" for="queueNameInput">Queue Name</label>
+        <input type="text" id="queueNameInput" class="form-input" value="Tier-1 Support Queue" />
+
+        <label class="form-label" for="queueIdInput">Queue Group ID (00G prefix)</label>
+        <input type="text" id="queueIdInput" class="form-input" value="00G5g000003ABC1" />
+
+        <h4 class="modal-subheading">1. Standard Inflow Query (Created into Queue)</h4>
+        <pre class="soql-code"><code id="soqlStandard">SELECT Id, CaseNumber, Subject, Priority, Origin, CreatedDate, Status 
+FROM Case 
+WHERE OwnerId = '00G5g000003ABC1' 
+AND CreatedDate = LAST_MONTH 
+ORDER BY CreatedDate ASC</code></pre>
+
+        <h4 class="modal-subheading">2. Case History Query (Reassigned / Picked Out of Queue)</h4>
+        <pre class="soql-code"><code id="soqlHistory">SELECT CaseId, Case.CaseNumber, Case.Priority, Case.Origin, CreatedDate, NewValue 
+FROM CaseHistory 
+WHERE Field = 'Owner' 
+AND NewValue = 'Admin Queue' 
+AND CreatedDate = LAST_MONTH</code></pre>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" id="saveSettingsBtn">Save Changes</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
