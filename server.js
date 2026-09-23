@@ -1,15 +1,24 @@
 // server.js
 require('dotenv').config();
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const jsforce = require('jsforce');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = '0.0.0.0'; // Binds to all network interfaces on the VM
 
 app.use(cors());
 app.use(express.json());
-app.use(express.static('.'));
+
+// 1. Resolve static files relative to this file's exact directory (__dirname)
+app.use(express.static(__dirname));
+
+// 2. Explicit root route fallback to guarantee index.html is served
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
 
 const {
   SF_LOGIN_URL = 'https://greyorangeorg.my.salesforce.com',
@@ -99,7 +108,6 @@ app.get('/api/queue-inflow', async (req, res) => {
     console.log(`Fetching Inflow for: "${queue.Name}" (${rangeParam} -> ${sfDateFilter})`);
     console.log(`======================================================`);
 
-    // 1. Fetch tickets currently sitting in the queue right now
     const currentQueueSoql = `
       SELECT Id, CaseNumber, Subject, Status, Automation_Priority__c, CreatedDate 
       FROM Case 
@@ -107,7 +115,6 @@ app.get('/api/queue-inflow', async (req, res) => {
       ORDER BY CreatedDate ASC
     `;
 
-    // 2. Fetch ownership events (strictly Field = 'Owner', newest first)
     const historySoql = `
       SELECT CaseId, Field, OldValue, NewValue, CreatedDate 
       FROM CaseHistory 
@@ -116,9 +123,6 @@ app.get('/api/queue-inflow', async (req, res) => {
       ORDER BY CreatedDate DESC
     `;
 
-    console.log(`Querying current queue status & ownership transfers...`);
-
-    // Run both queries with full pagination support
     const [currentResult, historyRecords] = await Promise.all([
       conn.query(currentQueueSoql),
       (async () => {
@@ -139,7 +143,6 @@ app.get('/api/queue-inflow', async (req, res) => {
     const caseMap = new Map();
     const caseInflowTimestamps = new Map();
 
-    // Add cases currently in the queue
     currentResult.records.forEach((c) => {
       caseMap.set(c.Id, {
         Id: c.Id,
@@ -151,7 +154,6 @@ app.get('/api/queue-inflow', async (req, res) => {
       });
     });
 
-    // Queue identification helper (matches Name, DeveloperName, or 15-char ID)
     const qNameLower = queue.Name.toLowerCase().trim();
     const qDevLower = queue.DeveloperName.toLowerCase().trim();
     const q15Id = queue.Id.substring(0, 15).toLowerCase();
@@ -170,7 +172,6 @@ app.get('/api/queue-inflow', async (req, res) => {
 
       if (movedIn || movedOut) {
         targetCaseIds.add(h.CaseId);
-        // Track the timestamp when it entered this queue
         if (movedIn && !caseInflowTimestamps.has(h.CaseId)) {
           caseInflowTimestamps.set(h.CaseId, h.CreatedDate);
         }
@@ -179,7 +180,6 @@ app.get('/api/queue-inflow', async (req, res) => {
 
     console.log(`[DEBUG] Cases identified that entered/passed through "${queue.Name}": ${targetCaseIds.size}`);
 
-    // Query full details for historical cases not currently in the queue
     const missingCaseIds = Array.from(targetCaseIds).filter((id) => !caseMap.has(id));
 
     if (missingCaseIds.length > 0) {
@@ -201,7 +201,6 @@ app.get('/api/queue-inflow', async (req, res) => {
             Subject: c.Subject || '(No Subject)',
             Status: c.Status,
             Automation_Priority__c: c.Automation_Priority__c || 'Medium',
-            // Use the date it entered the queue if available, otherwise Case CreatedDate
             CreatedDate: caseInflowTimestamps.get(c.Id) || c.CreatedDate,
           });
         });
@@ -226,6 +225,10 @@ app.get('/api/queue-inflow', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Dashboard running at: http://localhost:${PORT}`);
+app.listen(PORT, HOST, () => {
+  console.log(`=========================================`);
+  console.log(`Server listening on all interfaces at port ${PORT}`);
+  console.log(`Local VM access:  http://localhost:${PORT}`);
+  console.log(`Remote access:    http://<YOUR_VM_IP>:${PORT}`);
+  console.log(`=========================================`);
 });
