@@ -28,6 +28,25 @@ const SF_COLORS = {
   gridLines: "#EAEAEA"
 };
 
+// Vibrant, high-contrast palette for Case Statuses
+const VIBRANT_STATUS_PALETTE = {
+  New: "#00B4D8",           // Electric Sky Blue
+  Assigned: "#FF7700",      // Vibrant Amber / Electric Orange
+  "In Progress": "#8B5CF6", // Neon Violet / Purple
+  Closed: "#10B981",        // Bright Mint / Emerald Green
+  Resolved: "#06B6D4",      // Vivid Cyan
+  Escalated: "#F43F5E",     // Hot Crimson / Rose Red
+  Pending: "#FBBF24",       // Bright Golden Yellow
+  "On Hold": "#EC4899",     // Neon Fuchsia / Pink
+  Unknown: "#64748B"        // Slate Gray fallback
+};
+
+const FALLBACK_VIBRANT_COLORS = [
+  "#00B4D8", "#FF7700", "#10B981", "#8B5CF6", 
+  "#F43F5E", "#FBBF24", "#EC4899", "#06B6D4", 
+  "#3B82F6", "#14B8A6", "#A855F7", "#FB923C"
+];
+
 document.addEventListener("DOMContentLoaded", async () => {
   setupEventListeners();
   updateDateRangeLabel();
@@ -84,21 +103,45 @@ async function loadDashboardData() {
     }
     throw new Error("Invalid response payload structure");
   } catch (err) {
-    console.warn("Could not retrieve live Salesforce data, generating dynamic simulation:", err.message);
+    console.warn("Could not retrieve live Salesforce data:", err.message);
     state.isLiveApiConnected = false;
-    loadSimulatedData();
-    populateWeekSelectOptions();
   }
 }
 
-function normalizeType(rawType) {
-  if (!rawType) return "Incident";
-  const t = String(rawType).toLowerCase().trim();
-  if (t.includes("service") || t.includes("request") || t === "sr") return "Service Request";
-  if (t.includes("query") || t.includes("question") || t.includes("inquiry")) return "Query";
-  if (t.includes("feature") || t.includes("enhancement") || t.includes("cr")) return "Feature Request";
-  if (t.includes("incident") || t.includes("issue") || t.includes("bug")) return "Incident";
-  return rawType;
+function normalizeType(rawType, subject = '') {
+  const t = String(rawType || '').toLowerCase().trim();
+  const s = String(subject || '').toLowerCase().trim();
+
+  if (
+    t.includes('feature') ||
+    t.includes('enhancement') ||
+    t.includes('change request') ||
+    t.includes('improvement') ||
+    t === 'cr' ||
+    t === 'fr' ||
+    t === 'rfc' ||
+    s.startsWith('[fr]') ||
+    s.startsWith('fr:') ||
+    s.startsWith('[feature]') ||
+    s.startsWith('feature:') ||
+    s.includes('feature request')
+  ) {
+    return 'Feature Request';
+  }
+
+  if (t.includes('service') || t.includes('request') || t === 'sr') {
+    return 'Service Request';
+  }
+
+  if (t.includes('query') || t.includes('question') || t.includes('inquiry')) {
+    return 'Query';
+  }
+
+  if (t.includes('incident') || t.includes('issue') || t.includes('bug')) {
+    return 'Incident';
+  }
+
+  return rawType || 'Incident';
 }
 
 function mapIncomingRecords(raw) {
@@ -111,12 +154,12 @@ function mapIncomingRecords(raw) {
       caseNumber: r.CaseNumber || `00${100000 + i}`,
       subject: r.Subject || "(No Subject)",
       agent: r.agent && r.agent !== "Unassigned" && r.agent !== "Admin Queue" ? r.agent : "Unassigned",
-      type: normalizeType(r.Type || r.Ticket_Type__c),
+      type: normalizeType(r.Type || r.Ticket_Type__c || r.RecordType?.Name, r.Subject),
       priority: r.Automation_Priority__c || r.Priority || "Medium",
       origin: r.Origin || "Portal",
       routedDate: dateObj,
       dateKey: dateObj.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-      weekLabel: r.weekLabel || "", // Uses synced week label directly from server.js
+      weekLabel: r.weekLabel || "",
       hourOfDay: dateObj.getHours(),
       status: r.Status || "New"
     };
@@ -186,53 +229,6 @@ function populateWeekSelectOptions() {
 
   select.value = currentVal;
   state.selectedWeek = select.value;
-}
-
-function loadSimulatedData() {
-  const generatedCases = [];
-  const now = new Date();
-  const types = ["Incident", "Service Request", "Query", "Feature Request"];
-  const priorities = ["Low", "Medium", "High", "Critical"];
-  const simulatedAgents = state.queueAgents.length > 0 ? state.queueAgents : ["Agent 1", "Agent 2", "Agent 3", "Agent 4"];
-  state.queueAgents = simulatedAgents;
-
-  let caseSeq = 200400;
-  const numDays = 45;
-
-  for (let i = numDays - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(now.getDate() - i);
-    const isWeekend = d.getDay() === 0 || d.getDay() === 6;
-    const dailyVolume = isWeekend ? Math.floor(Math.random() * 2) : Math.floor(Math.random() * 8 + 4);
-
-    for (let c = 0; c < dailyVolume; c++) {
-      caseSeq++;
-      const hour = Math.floor(Math.random() * 12 + 8);
-      const ticketDate = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hour, Math.floor(Math.random() * 60));
-      const isAssigned = Math.random() > 0.25;
-      const assignedAgent = isAssigned ? simulatedAgents[c % simulatedAgents.length] : "Unassigned";
-      const status = !isAssigned ? "New" : (Math.random() > 0.4 ? "Assigned" : "Closed");
-
-      generatedCases.push({
-        id: `sim-${caseSeq}`,
-        caseNumber: `00${caseSeq}`,
-        subject: "Salesforce support case request",
-        agent: assignedAgent,
-        type: types[c % types.length],
-        priority: priorities[c % priorities.length],
-        origin: "Portal",
-        routedDate: ticketDate,
-        dateKey: ticketDate.toLocaleDateString("en-US", { month: "short", day: "numeric" }),
-        weekLabel: "",
-        hourOfDay: hour,
-        status: status
-      });
-    }
-  }
-
-  state.cases = generatedCases;
-  updateTabBadges();
-  applyFilters();
 }
 
 function renderDashboard() {
@@ -436,6 +432,9 @@ function renderDailyInflowChart() {
   });
 }
 
+/**
+ * High-Contrast Vibrant Status Donut Chart
+ */
 function renderStatusChart() {
   const canvas = document.getElementById("statusChart");
   if (!canvas) return;
@@ -451,17 +450,9 @@ function renderStatusChart() {
   const labels = Object.keys(statusCounts);
   const data = Object.values(statusCounts);
 
-  const statusColorPalette = {
-    New: SF_COLORS.blue,
-    Assigned: SF_COLORS.orange,
-    "In Progress": SF_COLORS.purple,
-    Closed: SF_COLORS.green,
-    Resolved: SF_COLORS.green,
-    Escalated: SF_COLORS.red,
-    Pending: SF_COLORS.teal
-  };
-
-  const bgColors = labels.map((status) => statusColorPalette[status] || SF_COLORS.navy);
+  const bgColors = labels.map((status, idx) => {
+    return VIBRANT_STATUS_PALETTE[status] || FALLBACK_VIBRANT_COLORS[idx % FALLBACK_VIBRANT_COLORS.length];
+  });
 
   state.charts.status = new Chart(ctx, {
     type: "doughnut",
@@ -471,14 +462,16 @@ function renderStatusChart() {
         {
           data: data,
           backgroundColor: bgColors,
-          borderWidth: labels.map((l) => (l === state.selectedStatusFilter ? 4 : 1)),
-          borderColor: labels.map((l) => (l === state.selectedStatusFilter ? "#000" : "#fff"))
+          borderWidth: labels.map((l) => (l === state.selectedStatusFilter ? 4 : 2)),
+          borderColor: labels.map((l) => (l === state.selectedStatusFilter ? "#1E293B" : "#FFFFFF")),
+          hoverOffset: 6
         }
       ]
     },
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      cutout: "68%",
       onHover: (event, chartElement) => {
         event.native.target.style.cursor = chartElement.length ? "pointer" : "default";
       },
@@ -486,11 +479,7 @@ function renderStatusChart() {
         if (elements && elements.length > 0) {
           const index = elements[0].index;
           const clickedStatus = labels[index];
-          if (state.selectedStatusFilter === clickedStatus) {
-            state.selectedStatusFilter = null;
-          } else {
-            state.selectedStatusFilter = clickedStatus;
-          }
+          state.selectedStatusFilter = state.selectedStatusFilter === clickedStatus ? null : clickedStatus;
           renderTable();
           renderStatusChart();
         }
@@ -498,7 +487,22 @@ function renderStatusChart() {
       plugins: {
         legend: {
           position: "bottom",
-          labels: { boxWidth: 12, font: { weight: "500" } }
+          labels: {
+            boxWidth: 12,
+            boxHeight: 12,
+            usePointStyle: true,
+            pointStyle: "circle",
+            padding: 12,
+            font: { weight: "600", size: 12 }
+          }
+        },
+        tooltip: {
+          backgroundColor: "#1E293B",
+          padding: 10,
+          titleFont: { weight: "700" },
+          callbacks: {
+            label: (ctx) => ` ${ctx.label}: ${ctx.raw} cases (${((ctx.raw / (data.reduce((a, b) => a + b, 0) || 1)) * 100).toFixed(1)}%)`
+          }
         }
       }
     }
