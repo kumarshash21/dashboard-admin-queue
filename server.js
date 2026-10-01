@@ -6,7 +6,7 @@ const cors = require('cors');
 const jsforce = require('jsforce');
 
 const app = express();
-const PORT = process.env.PORT || 9001;
+const PORT = process.env.PORT || 9001; // Explicitly anchored to 9001
 const HOST = '0.0.0.0';
 
 app.use(cors());
@@ -28,7 +28,7 @@ let cachedConn = null;
 let cachedQueue = null;
 let caseFieldsCache = null;
 
-// Response Cache (15-Minute TTL)
+// In-Memory RAM Cache (15-Minute TTL)
 const responseCache = {
   store: new Map(),
   get(key) {
@@ -50,6 +50,9 @@ const responseCache = {
     this.store.delete(key);
   },
 };
+
+// In-flight Promise tracker: Prevents duplicate queries from running concurrently
+const inFlightRequests = new Map();
 
 async function getSalesforceConnection(forceRefresh = false) {
   if (!SF_CLIENT_ID || !SF_CLIENT_SECRET) {
@@ -286,284 +289,320 @@ async function queryAllHistory(conn, soqlQuery) {
   return records;
 }
 
-/**
- * Core Inflow Fetch Engine
- */
-async function fetchInflowData(queueName = SF_QUEUE_NAME, rangeParam = 'thisMonth', isRetry = false) {
-  const conn = await getSalesforceConnection(isRetry);
-  const queue = await getQueueMetadata(conn, queueName);
-  const schemaFields = await getCaseTypeFields(conn);
-  const directQueueMembers = await getQueueMembers(conn, queue.Id);
-
-  const extraCols = [];
-  if (schemaFields.hasRecordType) extraCols.push('RecordType.Name');
-  if (schemaFields.hasTicketType) extraCols.push('Ticket_Type__c');
-  if (schemaFields.hasCaseType) extraCols.push('Case_Type__c');
-  if (schemaFields.hasCategory) extraCols.push('Category__c');
-
-  const selectClause = [
-    'Id', 'CaseNumber', 'Subject', 'Status', 'Automation_Priority__c', 'Type',
-    ...extraCols,
-    'CreatedDate', 'OwnerId', 'Owner.Name'
-  ].join(', ');
-
-  const currentQueueSoql = `
-    SELECT ${selectClause} 
-    FROM Case 
-    WHERE OwnerId = '${queue.Id}' 
-    ORDER BY CreatedDate ASC
-  `;
-
-  // Segment SOQL calls to run in parallel
-  const historyQueries = [];
-  if (rangeParam === 'lastMonth') {
-    historyQueries.push(
-      `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
-    );
-  } else if (rangeParam === 'thisMonth') {
-    historyQueries.push(
-      `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`
-    );
-  } else {
-    historyQueries.push(
-      `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`,
-      `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
-    );
+async function poolAll(tasks, limit = 5) {
+  const results = [];
+  const running = [];
+  for (const task of tasks) {
+    const p = Promise.resolve().then(task);
+    results.push(p);
+    if (limit <= tasks.length) {
+      const e = p.then(() => running.splice(running.indexOf(e), 1));
+      running.push(e);
+      if (running.length >= limit) {
+        await Promise.race(running);
+      }
+    }
   }
+  return Promise.all(results);
+}
 
-  const [currentResult, ...historyResults] = await Promise.all([
-    conn.query(currentQueueSoql),
-    ...historyQueries.map((q) => queryAllHistory(conn, q)),
-  ]);
+/**
+ * Core Execution Engine with Lock Guard & Session Recovery
+ */
+async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
+  try {
+    const conn = await getSalesforceConnection(isRetry);
+    const queue = await getQueueMetadata(conn, queueName);
+    const schemaFields = await getCaseTypeFields(conn);
+    const directQueueMembers = await getQueueMembers(conn, queue.Id);
 
-  const historyRecords = historyResults.flat();
-  const caseMap = new Map();
-  const caseInflowTimestamps = new Map();
-  const caseAgentMap = new Map();
-  const detectedHistoricalAgents = new Set(directQueueMembers);
-  const rawTypesFound = new Set();
+    const extraCols = [];
+    if (schemaFields.hasRecordType) extraCols.push('RecordType.Name');
+    if (schemaFields.hasTicketType) extraCols.push('Ticket_Type__c');
+    if (schemaFields.hasCaseType) extraCols.push('Case_Type__c');
+    if (schemaFields.hasCategory) extraCols.push('Category__c');
 
-  currentResult.records.forEach((c) => {
-    const rawT = extractRawType(c);
-    if (rawT) rawTypesFound.add(rawT);
+    const selectClause = [
+      'Id', 'CaseNumber', 'Subject', 'Status', 'Automation_Priority__c', 'Type',
+      ...extraCols,
+      'CreatedDate', 'OwnerId', 'Owner.Name'
+    ].join(', ');
 
-    caseMap.set(c.Id, {
-      Id: c.Id,
-      CaseNumber: c.CaseNumber,
-      Subject: c.Subject || '(No Subject)',
-      agent: 'Unassigned',
-      Status: c.Status,
-      Automation_Priority__c: c.Automation_Priority__c || 'Medium',
-      Type: normalizeType(rawT, c.Subject),
-      CreatedDate: c.CreatedDate,
-    });
-  });
+    const currentQueueSoql = `
+      SELECT ${selectClause} 
+      FROM Case 
+      WHERE OwnerId = '${queue.Id}' 
+      ORDER BY CreatedDate ASC
+    `;
 
-  const qNameLower = queue.Name.toLowerCase().trim();
-  const qDevLower = queue.DeveloperName.toLowerCase().trim();
-  const q15Id = queue.Id.substring(0, 15).toLowerCase();
-
-  const isTargetQueue = (val) => {
-    if (!val) return false;
-    const str = String(val).toLowerCase().trim();
-    return str === qNameLower || str === qDevLower || str.includes(q15Id);
-  };
-
-  const targetCaseIds = new Set();
-
-  historyRecords.forEach((h) => {
-    const movedIn = isTargetQueue(h.NewValue);
-    const movedOut = isTargetQueue(h.OldValue);
-
-    if (movedIn || movedOut) {
-      targetCaseIds.add(h.CaseId);
-      if (movedIn && !caseInflowTimestamps.has(h.CaseId)) {
-        caseInflowTimestamps.set(h.CaseId, h.CreatedDate);
-      }
-      if (movedOut && !isTargetQueue(h.NewValue) && h.NewValue && h.NewValue !== 'Automated Process') {
-        caseAgentMap.set(h.CaseId, h.NewValue);
-        detectedHistoricalAgents.add(h.NewValue);
-      }
-    }
-  });
-
-  const missingCaseIds = Array.from(targetCaseIds).filter((id) => !caseMap.has(id));
-
-  // OPTIMIZATION: Concurrent Chunk Hydration using Promise.all
-  if (missingCaseIds.length > 0) {
-    const chunkSize = 200;
-    const chunkPromises = [];
-
-    for (let i = 0; i < missingCaseIds.length; i += chunkSize) {
-      const chunk = missingCaseIds.slice(i, i + chunkSize);
-      const idsFormatted = chunk.map((id) => `'${id}'`).join(',');
-      const query = `
-        SELECT ${selectClause} 
-        FROM Case 
-        WHERE Id IN (${idsFormatted})
-      `;
-      chunkPromises.push(conn.query(query));
+    const historyQueries = [];
+    if (rangeParam === 'lastMonth') {
+      historyQueries.push(
+        `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
+      );
+    } else if (rangeParam === 'thisMonth') {
+      historyQueries.push(
+        `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`
+      );
+    } else {
+      historyQueries.push(
+        `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`,
+        `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
+      );
     }
 
-    const chunkResults = await Promise.all(chunkPromises);
+    const [currentResult, ...historyResults] = await Promise.all([
+      conn.query(currentQueueSoql),
+      ...historyQueries.map((q) => queryAllHistory(conn, q)),
+    ]);
 
-    chunkResults.forEach((res) => {
-      res.records.forEach((c) => {
-        const rawT = extractRawType(c);
-        if (rawT) rawTypesFound.add(rawT);
+    const historyRecords = historyResults.flat();
+    const caseMap = new Map();
+    const caseInflowTimestamps = new Map();
+    const caseAgentMap = new Map();
+    const detectedHistoricalAgents = new Set(directQueueMembers);
+    const rawTypesFound = new Set();
 
-        const ownerName = c.Owner && c.Owner.Name ? c.Owner.Name : null;
-        const agentName =
-          ownerName && !isTargetQueue(ownerName) && ownerName !== 'Automated Process'
-            ? ownerName
-            : caseAgentMap.get(c.Id) || 'Unassigned';
+    currentResult.records.forEach((c) => {
+      const rawT = extractRawType(c);
+      if (rawT) rawTypesFound.add(rawT);
 
-        if (agentName !== 'Unassigned') detectedHistoricalAgents.add(agentName);
-
-        caseMap.set(c.Id, {
-          Id: c.Id,
-          CaseNumber: c.CaseNumber,
-          Subject: c.Subject || '(No Subject)',
-          agent: agentName,
-          Status: c.Status,
-          Automation_Priority__c: c.Automation_Priority__c || 'Medium',
-          Type: normalizeType(rawT, c.Subject),
-          CreatedDate: caseInflowTimestamps.get(c.Id) || c.CreatedDate,
-        });
+      caseMap.set(c.Id, {
+        Id: c.Id,
+        CaseNumber: c.CaseNumber,
+        Subject: c.Subject || '(No Subject)',
+        agent: 'Unassigned',
+        Status: c.Status,
+        Automation_Priority__c: c.Automation_Priority__c || 'Medium',
+        Type: normalizeType(rawT, c.Subject),
+        CreatedDate: c.CreatedDate,
       });
     });
+
+    const qNameLower = queue.Name.toLowerCase().trim();
+    const qDevLower = queue.DeveloperName.toLowerCase().trim();
+    const q15Id = queue.Id.substring(0, 15).toLowerCase();
+
+    const isTargetQueue = (val) => {
+      if (!val) return false;
+      const str = String(val).toLowerCase().trim();
+      return str === qNameLower || str === qDevLower || str.includes(q15Id);
+    };
+
+    const targetCaseIds = new Set();
+
+    historyRecords.forEach((h) => {
+      const movedIn = isTargetQueue(h.NewValue);
+      const movedOut = isTargetQueue(h.OldValue);
+
+      if (movedIn || movedOut) {
+        targetCaseIds.add(h.CaseId);
+        if (movedIn && !caseInflowTimestamps.has(h.CaseId)) {
+          caseInflowTimestamps.set(h.CaseId, h.CreatedDate);
+        }
+        if (movedOut && !isTargetQueue(h.NewValue) && h.NewValue && h.NewValue !== 'Automated Process') {
+          caseAgentMap.set(h.CaseId, h.NewValue);
+          detectedHistoricalAgents.add(h.NewValue);
+        }
+      }
+    });
+
+    const missingCaseIds = Array.from(targetCaseIds).filter((id) => !caseMap.has(id));
+
+    if (missingCaseIds.length > 0) {
+      const chunkSize = 200;
+      const tasks = [];
+
+      for (let i = 0; i < missingCaseIds.length; i += chunkSize) {
+        const chunk = missingCaseIds.slice(i, i + chunkSize);
+        const idsFormatted = chunk.map((id) => `'${id}'`).join(',');
+        const query = `
+          SELECT ${selectClause} 
+          FROM Case 
+          WHERE Id IN (${idsFormatted})
+        `;
+        tasks.push(() => conn.query(query));
+      }
+
+      const chunkResults = await poolAll(tasks, 5);
+
+      chunkResults.forEach((res) => {
+        res.records.forEach((c) => {
+          const rawT = extractRawType(c);
+          if (rawT) rawTypesFound.add(rawT);
+
+          const ownerName = c.Owner && c.Owner.Name ? c.Owner.Name : null;
+          const agentName =
+            ownerName && !isTargetQueue(ownerName) && ownerName !== 'Automated Process'
+              ? ownerName
+              : caseAgentMap.get(c.Id) || 'Unassigned';
+
+          if (agentName !== 'Unassigned') detectedHistoricalAgents.add(agentName);
+
+          caseMap.set(c.Id, {
+            Id: c.Id,
+            CaseNumber: c.CaseNumber,
+            Subject: c.Subject || '(No Subject)',
+            agent: agentName,
+            Status: c.Status,
+            Automation_Priority__c: c.Automation_Priority__c || 'Medium',
+            Type: normalizeType(rawT, c.Subject),
+            CreatedDate: caseInflowTimestamps.get(c.Id) || c.CreatedDate,
+          });
+        });
+      });
+    }
+
+    const unifiedRecords = Array.from(caseMap.values());
+    const resolvedQueueAgents = Array.from(detectedHistoricalAgents).filter(
+      (name) => name && !isTargetQueue(name) && name !== 'Automated Process' && name !== 'System'
+    );
+
+    const now = new Date();
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth();
+
+    const lastMonthDate = new Date(currentYear, currentMonth - 1, 1);
+    const lastYear = lastMonthDate.getFullYear();
+    const lastMonth = lastMonthDate.getMonth();
+
+    const monthNames = [
+      'January', 'February', 'March', 'April', 'May', 'June',
+      'July', 'August', 'September', 'October', 'November', 'December',
+    ];
+
+    const currentMonthBuckets = generateMonthlyWeekBuckets(currentYear, currentMonth);
+    const lastMonthBuckets = generateMonthlyWeekBuckets(lastYear, lastMonth);
+
+    const thisMonthRecords = [];
+    const lastMonthRecords = [];
+
+    unifiedRecords.forEach((c) => {
+      const d = new Date(c.CreatedDate);
+      const y = d.getFullYear();
+      const m = d.getMonth();
+
+      if (y === currentYear && m === currentMonth) {
+        thisMonthRecords.push(c);
+      } else if (y === lastYear && m === lastMonth) {
+        lastMonthRecords.push(c);
+      }
+    });
+
+    const currentMonthBifurcation = bifurcateRecordsByWeek(
+      thisMonthRecords,
+      currentMonthBuckets,
+      monthNames[currentMonth],
+      currentYear
+    );
+    const lastMonthBifurcation = bifurcateRecordsByWeek(
+      lastMonthRecords,
+      lastMonthBuckets,
+      monthNames[lastMonth],
+      lastYear
+    );
+
+    let displayRecords = unifiedRecords;
+
+    if (rangeParam === 'thisMonth') {
+      displayRecords = thisMonthRecords;
+    } else if (rangeParam === 'lastMonth') {
+      displayRecords = lastMonthRecords;
+    } else if (rangeParam === 'bothMonths') {
+      displayRecords = unifiedRecords;
+    } else if (rangeParam === 'rolling30') {
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(now.getDate() - 30);
+      displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= thirtyDaysAgo);
+    } else if (rangeParam === 'pastWeek1') {
+      const dStart = new Date(); dStart.setDate(now.getDate() - 7);
+      displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= dStart);
+    } else if (rangeParam === 'pastWeek2') {
+      const dEnd = new Date(); dEnd.setDate(now.getDate() - 7);
+      const dStart = new Date(); dStart.setDate(now.getDate() - 14);
+      displayRecords = unifiedRecords.filter((c) => {
+        const cd = new Date(c.CreatedDate);
+        return cd >= dStart && cd < dEnd;
+      });
+    } else if (rangeParam === 'pastWeek3') {
+      const dEnd = new Date(); dEnd.setDate(now.getDate() - 14);
+      const dStart = new Date(); dStart.setDate(now.getDate() - 21);
+      displayRecords = unifiedRecords.filter((c) => {
+        const cd = new Date(c.CreatedDate);
+        return cd >= dStart && cd < dEnd;
+      });
+    } else if (rangeParam === 'pastWeek4') {
+      const dEnd = new Date(); dEnd.setDate(now.getDate() - 21);
+      const dStart = new Date(); dStart.setDate(now.getDate() - 28);
+      displayRecords = unifiedRecords.filter((c) => {
+        const cd = new Date(c.CreatedDate);
+        return cd >= dStart && cd < dEnd;
+      });
+    }
+
+    const payload = {
+      success: true,
+      queueName: queue.Name,
+      queueId: queue.Id,
+      range: rangeParam,
+      queueAgents: resolvedQueueAgents,
+      totalSize: displayRecords.length,
+      records: displayRecords,
+      weeklyBifurcation: {
+        currentMonth: currentMonthBifurcation,
+        lastMonth: lastMonthBifurcation,
+        allWeeks: [
+          ...lastMonthBifurcation.weeks.map((w) => ({ ...w, month: lastMonthBifurcation.month })),
+          ...currentMonthBifurcation.weeks.map((w) => ({ ...w, month: currentMonthBifurcation.month })),
+        ],
+      },
+    };
+
+    responseCache.set(`${queueName}_${rangeParam}`, payload, 900);
+    return payload;
+  } catch (err) {
+    if ((err.errorCode === 'INVALID_SESSION_ID' || err.message.includes('Session expired')) && !isRetry) {
+      console.warn('[RETRY] Session expired. Refreshing token...');
+      cachedConn = null;
+      return executeInflowFetch(queueName, rangeParam, true);
+    }
+    throw err;
+  }
+}
+
+// Thread-safe wrapper: Deduplicates in-flight calls
+async function fetchInflowData(queueName = SF_QUEUE_NAME, rangeParam = 'thisMonth') {
+  const cacheKey = `${queueName}_${rangeParam}`;
+
+  const cached = responseCache.get(cacheKey);
+  if (cached) return cached;
+
+  if (inFlightRequests.has(cacheKey)) {
+    return inFlightRequests.get(cacheKey);
   }
 
-  const unifiedRecords = Array.from(caseMap.values());
-  const resolvedQueueAgents = Array.from(detectedHistoricalAgents).filter(
-    (name) => name && !isTargetQueue(name) && name !== 'Automated Process' && name !== 'System'
-  );
-
-  const now = new Date();
-  const currentYear = now.getFullYear();
-  const currentMonth = now.getMonth();
-
-  const lastMonthDate = new Date(currentYear, currentMonth - 1, 1);
-  const lastYear = lastMonthDate.getFullYear();
-  const lastMonth = lastMonthDate.getMonth();
-
-  const monthNames = [
-    'January', 'February', 'March', 'April', 'May', 'June',
-    'July', 'August', 'September', 'October', 'November', 'December',
-  ];
-
-  const currentMonthBuckets = generateMonthlyWeekBuckets(currentYear, currentMonth);
-  const lastMonthBuckets = generateMonthlyWeekBuckets(lastYear, lastMonth);
-
-  const thisMonthRecords = [];
-  const lastMonthRecords = [];
-
-  unifiedRecords.forEach((c) => {
-    const d = new Date(c.CreatedDate);
-    const y = d.getFullYear();
-    const m = d.getMonth();
-
-    if (y === currentYear && m === currentMonth) {
-      thisMonthRecords.push(c);
-    } else if (y === lastYear && m === lastMonth) {
-      lastMonthRecords.push(c);
-    }
+  const taskPromise = executeInflowFetch(queueName, rangeParam).finally(() => {
+    inFlightRequests.delete(cacheKey);
   });
 
-  const currentMonthBifurcation = bifurcateRecordsByWeek(
-    thisMonthRecords,
-    currentMonthBuckets,
-    monthNames[currentMonth],
-    currentYear
-  );
-  const lastMonthBifurcation = bifurcateRecordsByWeek(
-    lastMonthRecords,
-    lastMonthBuckets,
-    monthNames[lastMonth],
-    lastYear
-  );
-
-  let displayRecords = unifiedRecords;
-
-  if (rangeParam === 'thisMonth') {
-    displayRecords = thisMonthRecords;
-  } else if (rangeParam === 'lastMonth') {
-    displayRecords = lastMonthRecords;
-  } else if (rangeParam === 'bothMonths') {
-    displayRecords = unifiedRecords;
-  } else if (rangeParam === 'rolling30') {
-    const thirtyDaysAgo = new Date();
-    thirtyDaysAgo.setDate(now.getDate() - 30);
-    displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= thirtyDaysAgo);
-  } else if (rangeParam === 'pastWeek1') {
-    const dStart = new Date(); dStart.setDate(now.getDate() - 7);
-    displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= dStart);
-  } else if (rangeParam === 'pastWeek2') {
-    const dEnd = new Date(); dEnd.setDate(now.getDate() - 7);
-    const dStart = new Date(); dStart.setDate(now.getDate() - 14);
-    displayRecords = unifiedRecords.filter((c) => {
-      const cd = new Date(c.CreatedDate);
-      return cd >= dStart && cd < dEnd;
-    });
-  } else if (rangeParam === 'pastWeek3') {
-    const dEnd = new Date(); dEnd.setDate(now.getDate() - 14);
-    const dStart = new Date(); dStart.setDate(now.getDate() - 21);
-    displayRecords = unifiedRecords.filter((c) => {
-      const cd = new Date(c.CreatedDate);
-      return cd >= dStart && cd < dEnd;
-    });
-  } else if (rangeParam === 'pastWeek4') {
-    const dEnd = new Date(); dEnd.setDate(now.getDate() - 21);
-    const dStart = new Date(); dStart.setDate(now.getDate() - 28);
-    displayRecords = unifiedRecords.filter((c) => {
-      const cd = new Date(c.CreatedDate);
-      return cd >= dStart && cd < dEnd;
-    });
-  }
-
-  const payload = {
-    success: true,
-    queueName: queue.Name,
-    queueId: queue.Id,
-    range: rangeParam,
-    queueAgents: resolvedQueueAgents,
-    totalSize: displayRecords.length,
-    records: displayRecords,
-    weeklyBifurcation: {
-      currentMonth: currentMonthBifurcation,
-      lastMonth: lastMonthBifurcation,
-      allWeeks: [
-        ...lastMonthBifurcation.weeks.map((w) => ({ ...w, month: lastMonthBifurcation.month })),
-        ...currentMonthBifurcation.weeks.map((w) => ({ ...w, month: currentMonthBifurcation.month })),
-      ],
-    },
-  };
-
-  // Cache for 15 minutes (900 seconds)
-  responseCache.set(`${queueName}_${rangeParam}`, payload, 900);
-  return payload;
+  inFlightRequests.set(cacheKey, taskPromise);
+  return taskPromise;
 }
 
 app.get('/api/queue-inflow', async (req, res) => {
   const queueName = req.query.queueName || SF_QUEUE_NAME;
   const rangeParam = req.query.range || 'thisMonth';
   const forceRefresh = req.query.refresh === 'true';
-  const cacheKey = `${queueName}_${rangeParam}`;
 
-  // Serve immediately from in-memory cache if available (< 20ms)
-  if (!forceRefresh) {
-    const cachedData = responseCache.get(cacheKey);
-    if (cachedData) {
-      return res.json({ ...cachedData, cached: true });
-    }
+  if (forceRefresh) {
+    responseCache.delete(`${queueName}_${rangeParam}`);
   }
 
   try {
     const payload = await fetchInflowData(queueName, rangeParam);
-    return res.json({ ...payload, cached: false });
+    return res.json({ ...payload, cached: !forceRefresh && responseCache.get(`${queueName}_${rangeParam}`) !== null });
   } catch (err) {
     console.error('Error handling /api/queue-inflow:', err.message);
-    if (err.errorCode === 'INVALID_SESSION_ID') cachedConn = null;
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -571,25 +610,14 @@ app.get('/api/queue-inflow', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
-    const identity = await conn.identity();
-    res.json({
-      status: 'ok',
-      salesforce: 'connected',
-      userId: identity.user_id,
-      orgId: identity.organization_id,
-      timestamp: new Date(),
-    });
+    res.json({ status: 'ok', salesforce: 'connected', timestamp: new Date() });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
 });
 
-/**
- * Background Pre-warming & Auto-Polling Engine
- * Ensures data is always hot in RAM so users experience sub-50ms loads
- */
 async function prewarmCache() {
-  console.log('[PRE-WARM] Background cache initialization started...');
+  console.log('[PRE-WARM] Initializing RAM cache in background...');
   try {
     const t0 = Date.now();
     await fetchInflowData(SF_QUEUE_NAME, 'thisMonth');
@@ -598,29 +626,23 @@ async function prewarmCache() {
     const t1 = Date.now();
     await fetchInflowData(SF_QUEUE_NAME, 'lastMonth');
     console.log(`[PRE-WARM] "lastMonth" warmed in ${((Date.now() - t1) / 1000).toFixed(1)}s`);
-    console.log('[PRE-WARM] All primary caches warm. Dashboard loads will now be instant.');
   } catch (err) {
-    console.warn('[PRE-WARM ERROR]', err.message);
+    console.warn('[PRE-WARM WARNING]', err.message);
   }
 }
 
-// Background auto-refresh every 5 minutes
+// Auto-sync every 5 minutes
 setInterval(async () => {
-  console.log('[AUTO-REFRESH] Running silent background sync...');
   try {
-    await fetchInflowData(SF_QUEUE_NAME, 'thisMonth');
+    await executeInflowFetch(SF_QUEUE_NAME, 'thisMonth');
   } catch (err) {
-    console.warn('[AUTO-REFRESH ERROR]', err.message);
+    console.warn('[SYNC WARNING]', err.message);
   }
-}, 30 * 60 * 1000);
+}, 5 * 60 * 1000);
 
 app.listen(PORT, HOST, () => {
   console.log(`=========================================`);
-  console.log(`Server listening on all interfaces at port ${PORT}`);
-  console.log(`Local VM access:  http://localhost:${PORT}`);
-  console.log(`Remote access:    http://172.35.0.13:${PORT}`);
+  console.log(`Production Server listening on port ${PORT}`);
   console.log(`=========================================`);
-
-  // Fire pre-warming asynchronously without blocking server startup
   prewarmCache();
 });
