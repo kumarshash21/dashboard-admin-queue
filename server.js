@@ -1,4 +1,5 @@
 // server.js
+process.env.TZ = 'Asia/Kolkata'; // Align Node.js to Salesforce Org timezone (IST)
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
@@ -6,7 +7,7 @@ const cors = require('cors');
 const jsforce = require('jsforce');
 
 const app = express();
-const PORT = process.env.PORT || 9001; // Explicitly anchored to 9001
+const PORT = process.env.PORT || 9001;
 const HOST = '0.0.0.0';
 
 app.use(cors());
@@ -28,7 +29,7 @@ let cachedConn = null;
 let cachedQueue = null;
 let caseFieldsCache = null;
 
-// In-Memory RAM Cache (15-Minute TTL)
+// Response Cache: 2-Minute TTL (120s) for responsive updates
 const responseCache = {
   store: new Map(),
   get(key) {
@@ -40,7 +41,7 @@ const responseCache = {
     }
     return entry.data;
   },
-  set(key, data, ttlSeconds = 900) {
+  set(key, data, ttlSeconds = 120) {
     this.store.set(key, {
       data,
       expiresAt: Date.now() + ttlSeconds * 1000,
@@ -51,7 +52,6 @@ const responseCache = {
   },
 };
 
-// In-flight Promise tracker: Prevents duplicate queries from running concurrently
 const inFlightRequests = new Map();
 
 async function getSalesforceConnection(forceRefresh = false) {
@@ -202,6 +202,24 @@ function normalizeType(rawType, subject = '') {
   return rawType || 'Incident';
 }
 
+function getOrgDateParts(dateInput) {
+  const d = new Date(dateInput);
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric',
+  });
+  const parts = formatter.formatToParts(d);
+  const map = {};
+  parts.forEach((p) => (map[p.type] = p.value));
+  return {
+    year: parseInt(map.year, 10),
+    monthIndex: parseInt(map.month, 10) - 1, // 0-indexed month
+    day: parseInt(map.day, 10),
+  };
+}
+
 function generateMonthlyWeekBuckets(year, monthIndex) {
   const monthNames = [
     'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
@@ -238,14 +256,15 @@ function generateMonthlyWeekBuckets(year, monthIndex) {
   return buckets;
 }
 
-function bifurcateRecordsByWeek(records, weeks, monthName, year) {
+function bifurcateRecordsByWeek(records, weeks, monthName, year, targetMonthIndex) {
   let monthTotal = 0;
 
   records.forEach((c) => {
-    const d = new Date(c.CreatedDate);
-    const day = d.getDate();
+    const { day, monthIndex } = getOrgDateParts(c.CreatedDate);
+    // If ticket was carried over into active queue from prior month, map to Day 1 of current month
+    const evalDay = (targetMonthIndex !== undefined && monthIndex !== targetMonthIndex) ? 1 : day;
 
-    const targetWeek = weeks.find((w) => day >= w.startDay && day <= w.endDay);
+    const targetWeek = weeks.find((w) => evalDay >= w.startDay && evalDay <= w.endDay);
     if (targetWeek) {
       targetWeek.totalInflow++;
       monthTotal++;
@@ -306,9 +325,6 @@ async function poolAll(tasks, limit = 5) {
   return Promise.all(results);
 }
 
-/**
- * Core Execution Engine with Lock Guard & Session Recovery
- */
 async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
   try {
     const conn = await getSalesforceConnection(isRetry);
@@ -407,6 +423,16 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       }
     });
 
+    // Update inflow timestamps for cases currently waiting in the queue
+    currentResult.records.forEach((c) => {
+      if (caseInflowTimestamps.has(c.Id)) {
+        const entry = caseMap.get(c.Id);
+        if (entry) {
+          entry.CreatedDate = caseInflowTimestamps.get(c.Id);
+        }
+      }
+    });
+
     const missingCaseIds = Array.from(targetCaseIds).filter((id) => !caseMap.has(id));
 
     if (missingCaseIds.length > 0) {
@@ -458,9 +484,10 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       (name) => name && !isTargetQueue(name) && name !== 'Automated Process' && name !== 'System'
     );
 
-    const now = new Date();
-    const currentYear = now.getFullYear();
-    const currentMonth = now.getMonth();
+    // Timezone-Aware Partitioning against Org Now (IST)
+    const nowOrg = getOrgDateParts(new Date());
+    const currentYear = nowOrg.year;
+    const currentMonth = nowOrg.monthIndex;
 
     const lastMonthDate = new Date(currentYear, currentMonth - 1, 1);
     const lastYear = lastMonthDate.getFullYear();
@@ -478,13 +505,17 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
     const lastMonthRecords = [];
 
     unifiedRecords.forEach((c) => {
-      const d = new Date(c.CreatedDate);
-      const y = d.getFullYear();
-      const m = d.getMonth();
+      const cOrg = getOrgDateParts(c.CreatedDate);
+      const isCurrentMonth = cOrg.year === currentYear && cOrg.monthIndex === currentMonth;
+      const isActiveInQueue = c.agent === 'Unassigned' || (c.status && c.status.toLowerCase() === 'new');
 
-      if (y === currentYear && m === currentMonth) {
+      // 1. Current Month includes cases created this month + any active queue case
+      if (isCurrentMonth || isActiveInQueue) {
         thisMonthRecords.push(c);
-      } else if (y === lastYear && m === lastMonth) {
+      }
+
+      // 2. Last Month includes tickets created in last month
+      if (cOrg.year === lastYear && cOrg.monthIndex === lastMonth) {
         lastMonthRecords.push(c);
       }
     });
@@ -493,13 +524,15 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       thisMonthRecords,
       currentMonthBuckets,
       monthNames[currentMonth],
-      currentYear
+      currentYear,
+      currentMonth
     );
     const lastMonthBifurcation = bifurcateRecordsByWeek(
       lastMonthRecords,
       lastMonthBuckets,
       monthNames[lastMonth],
-      lastYear
+      lastYear,
+      lastMonth
     );
 
     let displayRecords = unifiedRecords;
@@ -512,28 +545,35 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       displayRecords = unifiedRecords;
     } else if (rangeParam === 'rolling30') {
       const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(now.getDate() - 30);
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
       displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= thirtyDaysAgo);
     } else if (rangeParam === 'pastWeek1') {
-      const dStart = new Date(); dStart.setDate(now.getDate() - 7);
+      const dStart = new Date();
+      dStart.setDate(dStart.getDate() - 7);
       displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= dStart);
     } else if (rangeParam === 'pastWeek2') {
-      const dEnd = new Date(); dEnd.setDate(now.getDate() - 7);
-      const dStart = new Date(); dStart.setDate(now.getDate() - 14);
+      const dEnd = new Date();
+      dEnd.setDate(dEnd.getDate() - 7);
+      const dStart = new Date();
+      dStart.setDate(dStart.getDate() - 14);
       displayRecords = unifiedRecords.filter((c) => {
         const cd = new Date(c.CreatedDate);
         return cd >= dStart && cd < dEnd;
       });
     } else if (rangeParam === 'pastWeek3') {
-      const dEnd = new Date(); dEnd.setDate(now.getDate() - 14);
-      const dStart = new Date(); dStart.setDate(now.getDate() - 21);
+      const dEnd = new Date();
+      dEnd.setDate(dEnd.getDate() - 14);
+      const dStart = new Date();
+      dStart.setDate(dStart.getDate() - 21);
       displayRecords = unifiedRecords.filter((c) => {
         const cd = new Date(c.CreatedDate);
         return cd >= dStart && cd < dEnd;
       });
     } else if (rangeParam === 'pastWeek4') {
-      const dEnd = new Date(); dEnd.setDate(now.getDate() - 21);
-      const dStart = new Date(); dStart.setDate(now.getDate() - 28);
+      const dEnd = new Date();
+      dEnd.setDate(dEnd.getDate() - 21);
+      const dStart = new Date();
+      dStart.setDate(dStart.getDate() - 28);
       displayRecords = unifiedRecords.filter((c) => {
         const cd = new Date(c.CreatedDate);
         return cd >= dStart && cd < dEnd;
@@ -558,7 +598,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       },
     };
 
-    responseCache.set(`${queueName}_${rangeParam}`, payload, 900);
+    responseCache.set(`${queueName}_${rangeParam}`, payload, 120);
     return payload;
   } catch (err) {
     if ((err.errorCode === 'INVALID_SESSION_ID' || err.message.includes('Session expired')) && !isRetry) {
@@ -570,12 +610,13 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
   }
 }
 
-// Thread-safe wrapper: Deduplicates in-flight calls
-async function fetchInflowData(queueName = SF_QUEUE_NAME, rangeParam = 'thisMonth') {
+async function fetchInflowData(queueName = SF_QUEUE_NAME, rangeParam = 'thisMonth', forceRefresh = false) {
   const cacheKey = `${queueName}_${rangeParam}`;
 
-  const cached = responseCache.get(cacheKey);
-  if (cached) return cached;
+  if (!forceRefresh) {
+    const cached = responseCache.get(cacheKey);
+    if (cached) return cached;
+  }
 
   if (inFlightRequests.has(cacheKey)) {
     return inFlightRequests.get(cacheKey);
@@ -599,7 +640,7 @@ app.get('/api/queue-inflow', async (req, res) => {
   }
 
   try {
-    const payload = await fetchInflowData(queueName, rangeParam);
+    const payload = await fetchInflowData(queueName, rangeParam, forceRefresh);
     return res.json({ ...payload, cached: !forceRefresh && responseCache.get(`${queueName}_${rangeParam}`) !== null });
   } catch (err) {
     console.error('Error handling /api/queue-inflow:', err.message);
@@ -610,7 +651,7 @@ app.get('/api/queue-inflow', async (req, res) => {
 app.get('/api/health', async (req, res) => {
   try {
     const conn = await getSalesforceConnection();
-    res.json({ status: 'ok', salesforce: 'connected', timestamp: new Date() });
+    res.json({ status: 'ok', salesforce: 'connected', timezone: process.env.TZ, timestamp: new Date() });
   } catch (err) {
     res.status(500).json({ status: 'error', message: err.message });
   }
@@ -631,18 +672,18 @@ async function prewarmCache() {
   }
 }
 
-// Auto-sync every 5 minutes
+// Auto-sync every 2 minutes
 setInterval(async () => {
   try {
     await executeInflowFetch(SF_QUEUE_NAME, 'thisMonth');
   } catch (err) {
     console.warn('[SYNC WARNING]', err.message);
   }
-}, 5 * 60 * 1000);
+}, 2 * 60 * 1000);
 
 app.listen(PORT, HOST, () => {
   console.log(`=========================================`);
-  console.log(`Production Server listening on port ${PORT}`);
+  console.log(`Production Server listening on port ${PORT} [TZ: ${process.env.TZ}]`);
   console.log(`=========================================`);
   prewarmCache();
 });
