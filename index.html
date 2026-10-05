@@ -204,6 +204,13 @@
         <div class="table-toolbar">
           <div class="table-search-group">
             <input type="text" id="searchInput" placeholder="Search Case #, Subject, Agent..." class="table-search" />
+            
+            <!-- Status Filter Dropdown with Active (Default), View All, and Individual Statuses -->
+            <select id="statusFilter" class="table-filter" style="font-weight: 600;">
+              <option value="ACTIVE" selected>Status: Active (New / Assigned)</option>
+              <option value="ALL">Status: All (View All Cases)</option>
+            </select>
+
             <select id="priorityFilter" class="table-filter">
               <option value="ALL">All Priorities</option>
               <option value="Critical">Critical</option>
@@ -222,7 +229,7 @@
 
           <div style="display: flex; align-items: center; gap: 10px;">
             <div id="statusFilterIndicator" style="display: none; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; color: #0176D3; background: #eef4ff; padding: 4px 10px; border-radius: 12px;">
-              <span>Status: <strong id="activeStatusLabel">None</strong></span>
+              <span>Status: <strong id="activeStatusLabel">Active</strong></span>
               <button id="clearStatusFilterBtn" style="border: none; background: none; color: #ea001e; font-size: 16px; cursor: pointer; line-height: 1;">&times;</button>
             </div>
             <div class="record-count" id="recordCountText">Showing 0 active cases</div>
@@ -251,6 +258,6 @@
   </main>
 
   <!-- Cache-busting script tag -->
-  <script src="app.js?v=3.1"></script>
+  <script src="app.js?v=3.2"></script>
 </body>
 </html>

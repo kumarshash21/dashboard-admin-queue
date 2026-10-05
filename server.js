@@ -293,7 +293,11 @@ function bifurcateRecordsByWeek(records, weeks, monthName, year, targetMonthInde
   return {
     month: `${monthName} ${year}`,
     totalInflow: monthTotal,
-    weeks: weeks.map(({ startDay, endDay, ...rest }) => rest),
+    weeks: weeks.map(({ startDay, endDay, ...rest }) => ({
+      ...rest,
+      startDate: `${year}-${String(targetMonthIndex + 1).padStart(2, '0')}-${String(startDay).padStart(2, '0')}`,
+      endDate: `${year}-${String(targetMonthIndex + 1).padStart(2, '0')}-${String(endDay).padStart(2, '0')}`,
+    })),
   };
 }
 
@@ -325,6 +329,12 @@ async function poolAll(tasks, limit = 5) {
   return Promise.all(results);
 }
 
+// Ranges other than the two calendar months all derive from the same 2-month dataset,
+// so they share one Salesforce fetch/cache entry instead of each paying for their own.
+function scopeForRange(rangeParam) {
+  return rangeParam === 'thisMonth' || rangeParam === 'lastMonth' ? rangeParam : 'bothMonths';
+}
+
 async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
   try {
     const conn = await getSalesforceConnection(isRetry);
@@ -352,11 +362,12 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
     `;
 
     const historyQueries = [];
-    if (rangeParam === 'lastMonth') {
+    const scope = scopeForRange(rangeParam);
+    if (scope === 'lastMonth') {
       historyQueries.push(
         `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = LAST_MONTH ORDER BY CreatedDate DESC`
       );
-    } else if (rangeParam === 'thisMonth') {
+    } else if (scope === 'thisMonth') {
       historyQueries.push(
         `SELECT CaseId, Field, OldValue, NewValue, CreatedDate FROM CaseHistory WHERE Field = 'Owner' AND CreatedDate = THIS_MONTH ORDER BY CreatedDate DESC`
       );
@@ -535,56 +546,15 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       lastMonth
     );
 
-    let displayRecords = unifiedRecords;
-
-    if (rangeParam === 'thisMonth') {
-      displayRecords = thisMonthRecords;
-    } else if (rangeParam === 'lastMonth') {
-      displayRecords = lastMonthRecords;
-    } else if (rangeParam === 'bothMonths') {
-      displayRecords = unifiedRecords;
-    } else if (rangeParam === 'rolling30') {
-      const thirtyDaysAgo = new Date();
-      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
-      displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= thirtyDaysAgo);
-    } else if (rangeParam === 'pastWeek1') {
-      const dStart = new Date();
-      dStart.setDate(dStart.getDate() - 7);
-      displayRecords = unifiedRecords.filter((c) => new Date(c.CreatedDate) >= dStart);
-    } else if (rangeParam === 'pastWeek2') {
-      const dEnd = new Date();
-      dEnd.setDate(dEnd.getDate() - 7);
-      const dStart = new Date();
-      dStart.setDate(dStart.getDate() - 14);
-      displayRecords = unifiedRecords.filter((c) => {
-        const cd = new Date(c.CreatedDate);
-        return cd >= dStart && cd < dEnd;
-      });
-    } else if (rangeParam === 'pastWeek3') {
-      const dEnd = new Date();
-      dEnd.setDate(dEnd.getDate() - 14);
-      const dStart = new Date();
-      dStart.setDate(dStart.getDate() - 21);
-      displayRecords = unifiedRecords.filter((c) => {
-        const cd = new Date(c.CreatedDate);
-        return cd >= dStart && cd < dEnd;
-      });
-    } else if (rangeParam === 'pastWeek4') {
-      const dEnd = new Date();
-      dEnd.setDate(dEnd.getDate() - 21);
-      const dStart = new Date();
-      dStart.setDate(dStart.getDate() - 28);
-      displayRecords = unifiedRecords.filter((c) => {
-        const cd = new Date(c.CreatedDate);
-        return cd >= dStart && cd < dEnd;
-      });
-    }
+    // Base records for this scope; rolling/past-week narrowing happens in applyRangeFilter()
+    const displayRecords =
+      scope === 'thisMonth' ? thisMonthRecords : scope === 'lastMonth' ? lastMonthRecords : unifiedRecords;
 
     const payload = {
       success: true,
       queueName: queue.Name,
       queueId: queue.Id,
-      range: rangeParam,
+      range: scope,
       queueAgents: resolvedQueueAgents,
       totalSize: displayRecords.length,
       records: displayRecords,
@@ -598,7 +568,7 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
       },
     };
 
-    responseCache.set(`${queueName}_${rangeParam}`, payload, 120);
+    responseCache.set(`${queueName}_${scope}`, payload, 120);
     return payload;
   } catch (err) {
     if ((err.errorCode === 'INVALID_SESSION_ID' || err.message.includes('Session expired')) && !isRetry) {
@@ -610,24 +580,46 @@ async function executeInflowFetch(queueName, rangeParam, isRetry = false) {
   }
 }
 
+function applyRangeFilter(payload, rangeParam) {
+  const weekMatch = /^pastWeek(\d+)$/.exec(rangeParam);
+  let from = null;
+  let to = null;
+  if (rangeParam === 'rolling30') {
+    from = new Date();
+    from.setDate(from.getDate() - 30);
+  } else if (weekMatch) {
+    const n = parseInt(weekMatch[1], 10);
+    to = new Date();
+    to.setDate(to.getDate() - (n - 1) * 7);
+    from = new Date();
+    from.setDate(from.getDate() - n * 7);
+  } else {
+    return payload;
+  }
+  const records = payload.records.filter((c) => {
+    const cd = new Date(c.CreatedDate);
+    return cd >= from && (!to || weekMatch[1] === '1' || cd < to);
+  });
+  return { ...payload, range: rangeParam, totalSize: records.length, records };
+}
+
 async function fetchInflowData(queueName = SF_QUEUE_NAME, rangeParam = 'thisMonth', forceRefresh = false) {
-  const cacheKey = `${queueName}_${rangeParam}`;
+  const scope = scopeForRange(rangeParam);
+  const cacheKey = `${queueName}_${scope}`;
 
   if (!forceRefresh) {
     const cached = responseCache.get(cacheKey);
-    if (cached) return cached;
+    if (cached) return applyRangeFilter(cached, rangeParam);
   }
 
-  if (inFlightRequests.has(cacheKey)) {
-    return inFlightRequests.get(cacheKey);
+  if (!inFlightRequests.has(cacheKey)) {
+    inFlightRequests.set(
+      cacheKey,
+      executeInflowFetch(queueName, scope).finally(() => inFlightRequests.delete(cacheKey))
+    );
   }
 
-  const taskPromise = executeInflowFetch(queueName, rangeParam).finally(() => {
-    inFlightRequests.delete(cacheKey);
-  });
-
-  inFlightRequests.set(cacheKey, taskPromise);
-  return taskPromise;
+  return applyRangeFilter(await inFlightRequests.get(cacheKey), rangeParam);
 }
 
 app.get('/api/queue-inflow', async (req, res) => {
@@ -636,12 +628,12 @@ app.get('/api/queue-inflow', async (req, res) => {
   const forceRefresh = req.query.refresh === 'true';
 
   if (forceRefresh) {
-    responseCache.delete(`${queueName}_${rangeParam}`);
+    responseCache.delete(`${queueName}_${scopeForRange(rangeParam)}`);
   }
 
   try {
     const payload = await fetchInflowData(queueName, rangeParam, forceRefresh);
-    return res.json({ ...payload, cached: !forceRefresh && responseCache.get(`${queueName}_${rangeParam}`) !== null });
+    return res.json({ ...payload, cached: !forceRefresh && responseCache.get(`${queueName}_${scopeForRange(rangeParam)}`) !== null });
   } catch (err) {
     console.error('Error handling /api/queue-inflow:', err.message);
     res.status(500).json({ success: false, error: err.message });
@@ -667,6 +659,10 @@ async function prewarmCache() {
     const t1 = Date.now();
     await fetchInflowData(SF_QUEUE_NAME, 'lastMonth');
     console.log(`[PRE-WARM] "lastMonth" warmed in ${((Date.now() - t1) / 1000).toFixed(1)}s`);
+
+    const t2 = Date.now();
+    await fetchInflowData(SF_QUEUE_NAME, 'bothMonths');
+    console.log(`[PRE-WARM] "bothMonths" warmed in ${((Date.now() - t2) / 1000).toFixed(1)}s`);
   } catch (err) {
     console.warn('[PRE-WARM WARNING]', err.message);
   }
@@ -675,7 +671,10 @@ async function prewarmCache() {
 // Auto-sync every 2 minutes
 setInterval(async () => {
   try {
-    await executeInflowFetch(SF_QUEUE_NAME, 'thisMonth');
+    await Promise.all([
+      executeInflowFetch(SF_QUEUE_NAME, 'thisMonth'),
+      executeInflowFetch(SF_QUEUE_NAME, 'bothMonths'),
+    ]);
   } catch (err) {
     console.warn('[SYNC WARNING]', err.message);
   }

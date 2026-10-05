@@ -7,14 +7,16 @@ const state = {
   timeRange: "thisMonth",
   selectedTab: "ALL",
   selectedWeek: "CURRENT_WEEK",
-  selectedStatusFilter: null,
+  selectedStatusFilter: "ACTIVE", // Default view remains Active (New / Assigned)
   queueAgents: [],
   weeklyBifurcation: null,
   cases: [],
   filteredCases: [],
   charts: {},
   showMovingAverage: true,
-  isLiveApiConnected: false
+  isLiveApiConnected: false,
+  loadController: null,
+  weekSyncedRange: null
 };
 
 const SF_COLORS = {
@@ -84,11 +86,24 @@ function updateDateRangeLabel() {
   }
 }
 
+function setLoading(isLoading) {
+  document.body.classList.toggle("is-loading", isLoading);
+  const refreshBtn = document.getElementById("refreshDataBtn");
+  if (refreshBtn) refreshBtn.disabled = isLoading;
+}
+
 async function loadDashboardData() {
   updateDateRangeLabel();
+
+  // Cancel any in-flight request so rapid timeframe changes don't queue up or overwrite newer data
+  if (state.loadController) state.loadController.abort();
+  const controller = new AbortController();
+  state.loadController = controller;
+  setLoading(true);
+
   try {
     const url = `/api/queue-inflow?queueName=${encodeURIComponent(state.queueName)}&range=${state.timeRange}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: controller.signal });
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data = await response.json();
@@ -96,15 +111,22 @@ async function loadDashboardData() {
     if (data.records && Array.isArray(data.records)) {
       state.weeklyBifurcation = data.weeklyBifurcation || null;
       state.queueAgents = Array.isArray(data.queueAgents) ? data.queueAgents : [];
-      mapIncomingRecords(data.records);
       populateWeekSelectOptions();
+      mapIncomingRecords(data.records);
+      populateStatusFilterOptions();
       state.isLiveApiConnected = true;
       return;
     }
     throw new Error("Invalid response payload structure");
   } catch (err) {
+    if (err.name === "AbortError") return; // superseded by a newer request
     console.warn("Could not retrieve live Salesforce data:", err.message);
     state.isLiveApiConnected = false;
+  } finally {
+    if (state.loadController === controller) {
+      state.loadController = null;
+      setLoading(false);
+    }
   }
 }
 
@@ -197,38 +219,106 @@ function updateTabBadges() {
   setBadge("badgeFR", counts["Feature Request"]);
 }
 
+// Returns the [start, end] day window (local time) covered by the selected timeframe
+function getTimeWindow() {
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const daysAgo = (n) => new Date(today.getFullYear(), today.getMonth(), today.getDate() - n);
+
+  switch (state.timeRange) {
+    case "thisMonth":
+      return [new Date(now.getFullYear(), now.getMonth(), 1), today];
+    case "lastMonth":
+      return [new Date(now.getFullYear(), now.getMonth() - 1, 1), new Date(now.getFullYear(), now.getMonth(), 0)];
+    case "bothMonths":
+      return [new Date(now.getFullYear(), now.getMonth() - 1, 1), today];
+    case "rolling30":
+      return [daysAgo(30), today];
+    default: {
+      const weekNum = parseInt(state.timeRange.replace("pastWeek", ""), 10) || 1;
+      return [daysAgo(weekNum * 7), daysAgo((weekNum - 1) * 7)];
+    }
+  }
+}
+
+function parseLocalDate(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
 function populateWeekSelectOptions() {
   const select = document.getElementById("agentWeekSelect");
   if (!select) return;
 
-  const currentVal = select.value || "CURRENT_WEEK";
+  const rangeChanged = state.weekSyncedRange !== state.timeRange;
+  state.weekSyncedRange = state.timeRange;
+  const [winStart, winEnd] = getTimeWindow();
+
   select.innerHTML = "";
+  const addOption = (parent, value, text) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = text;
+    parent.appendChild(opt);
+  };
 
-  const optCurrent = document.createElement("option");
-  optCurrent.value = "CURRENT_WEEK";
-  optCurrent.textContent = "Current Week";
-  select.appendChild(optCurrent);
+  const allowed = new Set(["ALL_WEEKS"]);
+  if (state.timeRange === "thisMonth" || state.timeRange === "rolling30" || state.timeRange === "pastWeek1") {
+    addOption(select, "CURRENT_WEEK", state.timeRange === "thisMonth" ? "Current Week" : "Last 7 Days");
+    allowed.add("CURRENT_WEEK");
+  }
+  addOption(select, "ALL_WEEKS", "All Weeks (Combined)");
 
-  const optAll = document.createElement("option");
-  optAll.value = "ALL_WEEKS";
-  optAll.textContent = "All Weeks (Combined)";
-  select.appendChild(optAll);
-
-  if (state.weeklyBifurcation && state.weeklyBifurcation.allWeeks) {
+  // Only list calendar weeks that overlap the selected timeframe
+  const weeks = ((state.weeklyBifurcation && state.weeklyBifurcation.allWeeks) || []).filter(
+    (w) => !w.startDate || (parseLocalDate(w.endDate) >= winStart && parseLocalDate(w.startDate) <= winEnd)
+  );
+  if (weeks.length) {
     const optGroup = document.createElement("optgroup");
-    optGroup.label = "Available Calendar Weeks";
+    optGroup.label = "Weeks in Selected Timeframe";
+    weeks.forEach((w) => {
+      addOption(optGroup, w.label, `${w.month} - ${w.label} (${w.week})`);
+      allowed.add(w.label);
+    });
+    select.appendChild(optGroup);
+  }
 
-    state.weeklyBifurcation.allWeeks.forEach((w) => {
+  // On a timeframe change, reset to the natural default; otherwise keep the user's pick if still valid
+  const preferred = rangeChanged
+    ? (state.timeRange === "thisMonth" ? "CURRENT_WEEK" : "ALL_WEEKS")
+    : state.selectedWeek;
+  select.value = allowed.has(preferred) ? preferred : "ALL_WEEKS";
+  state.selectedWeek = select.value;
+}
+
+function populateStatusFilterOptions() {
+  const select = document.getElementById("statusFilter");
+  if (!select) return;
+
+  const currentVal = state.selectedStatusFilter || "ACTIVE";
+  const uniqueStatuses = new Set();
+  state.cases.forEach((c) => {
+    if (c.status) uniqueStatuses.add(c.status);
+  });
+
+  select.innerHTML = `
+    <option value="ACTIVE">Status: Active (New / Assigned)</option>
+    <option value="ALL">Status: All (View All Cases)</option>
+  `;
+
+  if (uniqueStatuses.size > 0) {
+    const optGroup = document.createElement("optgroup");
+    optGroup.label = "Individual Statuses";
+    Array.from(uniqueStatuses).sort().forEach((st) => {
       const opt = document.createElement("option");
-      opt.value = w.label;
-      opt.textContent = `${w.month} - ${w.label} (${w.week})`;
+      opt.value = st;
+      opt.textContent = `Status: ${st}`;
       optGroup.appendChild(opt);
     });
     select.appendChild(optGroup);
   }
 
   select.value = currentVal;
-  state.selectedWeek = select.value;
 }
 
 function renderDashboard() {
@@ -433,7 +523,7 @@ function renderDailyInflowChart() {
 }
 
 /**
- * High-Contrast Vibrant Status Donut Chart
+ * High-Contrast Vibrant Status Donut Chart with Bi-Directional Filter Sync
  */
 function renderStatusChart() {
   const canvas = document.getElementById("statusChart");
@@ -479,7 +569,14 @@ function renderStatusChart() {
         if (elements && elements.length > 0) {
           const index = elements[0].index;
           const clickedStatus = labels[index];
-          state.selectedStatusFilter = state.selectedStatusFilter === clickedStatus ? null : clickedStatus;
+          
+          // Toggle between clicked status and default ACTIVE view
+          state.selectedStatusFilter = state.selectedStatusFilter === clickedStatus ? "ACTIVE" : clickedStatus;
+          
+          // Synchronize dropdown element
+          const statusDropdown = document.getElementById("statusFilter");
+          if (statusDropdown) statusDropdown.value = state.selectedStatusFilter;
+
           renderTable();
           renderStatusChart();
         }
@@ -633,13 +730,24 @@ function renderTable() {
 
   let displayedCases = [];
 
-  if (state.selectedStatusFilter) {
-    displayedCases = state.filteredCases.filter((c) => (c.status || "").toLowerCase() === state.selectedStatusFilter.toLowerCase());
+  if (state.selectedStatusFilter === "ALL") {
+    // 1. View All Cases
+    displayedCases = state.filteredCases;
+    if (filterIndicator) {
+      filterIndicator.style.display = "inline-flex";
+      activeStatusLabel.textContent = "All Cases";
+    }
+  } else if (state.selectedStatusFilter && state.selectedStatusFilter !== "ACTIVE") {
+    // 2. Specific status selected (from donut or dropdown)
+    displayedCases = state.filteredCases.filter(
+      (c) => (c.status || "").toLowerCase() === state.selectedStatusFilter.toLowerCase()
+    );
     if (filterIndicator) {
       filterIndicator.style.display = "inline-flex";
       activeStatusLabel.textContent = state.selectedStatusFilter;
     }
   } else {
+    // 3. Default view: Active queue tickets (New / Assigned)
     displayedCases = state.filteredCases.filter((c) => {
       const s = (c.status || "").toLowerCase();
       return s === "new" || s === "assigned";
@@ -651,11 +759,15 @@ function renderTable() {
 
   const countElem = document.getElementById("recordCountText");
   if (countElem) {
-    const filterDesc = state.selectedStatusFilter ? `Status: ${state.selectedStatusFilter}` : `New / Assigned`;
-    countElem.textContent = `Showing ${Math.min(50, displayedCases.length)} of ${displayedCases.length} (${filterDesc})`;
+    let filterDesc = "New / Assigned";
+    if (state.selectedStatusFilter === "ALL") filterDesc = "All Statuses";
+    else if (state.selectedStatusFilter && state.selectedStatusFilter !== "ACTIVE") {
+      filterDesc = `Status: ${state.selectedStatusFilter}`;
+    }
+    countElem.textContent = `Showing ${Math.min(200, displayedCases.length)} of ${displayedCases.length} (${filterDesc})`;
   }
 
-  const displayList = displayedCases.slice(0, 50);
+  const displayList = displayedCases.slice(0, 200);
 
   if (displayList.length === 0) {
     tbody.innerHTML = `<tr><td colspan="8" style="text-align: center; color: #888; padding: 25px;">No cases found matching the active filters.</td></tr>`;
@@ -722,6 +834,15 @@ function setupEventListeners() {
     });
   });
 
+  const statusFilter = document.getElementById("statusFilter");
+  if (statusFilter) {
+    statusFilter.addEventListener("change", (e) => {
+      state.selectedStatusFilter = e.target.value;
+      renderTable();
+      renderStatusChart();
+    });
+  }
+
   const weekSelect = document.getElementById("agentWeekSelect");
   if (weekSelect) {
     weekSelect.addEventListener("change", (e) => {
@@ -758,7 +879,9 @@ function setupEventListeners() {
   const clearStatusBtn = document.getElementById("clearStatusFilterBtn");
   if (clearStatusBtn) {
     clearStatusBtn.addEventListener("click", () => {
-      state.selectedStatusFilter = null;
+      state.selectedStatusFilter = "ACTIVE";
+      const sf = document.getElementById("statusFilter");
+      if (sf) sf.value = "ACTIVE";
       renderTable();
       renderStatusChart();
     });
@@ -792,6 +915,7 @@ function handleFileUpload(event) {
         parseCSV(content);
       }
       populateWeekSelectOptions();
+      populateStatusFilterOptions();
       alert(`Imported ${state.cases.length} records successfully.`);
     } catch (err) {
       alert("Error reading file: " + err.message);
@@ -818,7 +942,11 @@ function parseCSV(text) {
 function exportToCSV() {
   const activeCases = state.filteredCases.filter((c) => {
     const s = (c.status || "").toLowerCase();
-    return state.selectedStatusFilter ? s === state.selectedStatusFilter.toLowerCase() : s === "new" || s === "assigned";
+    if (state.selectedStatusFilter === "ALL") return true;
+    if (state.selectedStatusFilter && state.selectedStatusFilter !== "ACTIVE") {
+      return s === state.selectedStatusFilter.toLowerCase();
+    }
+    return s === "new" || s === "assigned";
   });
 
   const headers = ["CaseNumber", "Subject", "Assigned Agent", "Type", "Priority", "Origin", "RoutedDate", "AgeHours", "Status"];
